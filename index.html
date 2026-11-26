@@ -8,17 +8,19 @@
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon-192.png" type="image/png">
 <link rel="stylesheet" href="style.css">
+<style>nav button[draggable=true]{cursor:grab}nav button.drop-target{outline:2px dashed #116759;outline-offset:2px}#state-filters label{margin:0}</style>
 <script src="app.js" defer></script>
 </head>
 <body>
-<header><strong>IdeaMemo</strong><details name="menu"><summary>ファイル</summary><div><button id="backup">バックアップ保存</button><button id="restore">読み込み</button></div></details><details name="menu"><summary>編集</summary><div><button id="undo">元に戻す</button><button id="redo">やり直す</button></div></details><details name="menu"><summary>設定</summary><div><button id="settings">Ollama</button><button id="cloud">Google Drive</button></div></details><span id="message" role="status"></span></header>
+<header><strong>IdeaMemo</strong><details name="menu"><summary>ファイル</summary><div><button id="backup">バックアップ保存</button><button id="restore">読み込み</button></div></details><details name="menu"><summary>編集</summary><div><button id="undo">元に戻す</button><button id="redo">やり直す</button></div></details><details name="menu"><summary>設定</summary><div><button id="settings">Ollama</button><button id="cloud">Google Drive</button><button id="deletion-folder">削除バックアップ先</button></div></details><span id="message" role="status"></span></header>
 <nav id="tabs" aria-label="アプリ"></nav>
 <main id="workspace" hidden>
 <details id="app-settings"><summary>アプリ設定</summary><label>アプリ名<input id="app-name"></label><label>プロンプトの共通情報<textarea id="context"></textarea></label></details>
 <div class="columns">
 <section>
 <div class="actions"><button id="add" class="primary">＋ 項目</button><button id="prompt">プロンプト作成</button><button id="history">出力履歴</button><button id="bulk">一括変更</button><button id="delete">選択項目を削除</button></div>
-<div class="actions"><input id="search" placeholder="メモを検索" aria-label="検索"><select id="filter" aria-label="状態"><option value="">すべての状態</option><option>新規</option><option>進行中</option><option>保留</option><option>完了</option><option>出力済</option><option>未出力</option></select></div>
+<div class="actions"><input id="search" placeholder="メモを検索" aria-label="検索"></div>
+<div class="actions" id="state-filters" role="group" aria-label="状態で絞り込み"></div>
 <details><summary>詳細検索</summary><div class="actions"><select id="group-filter" aria-label="グループ"></select><select id="image-filter" aria-label="画像"><option value="">画像すべて</option><option value="yes">画像あり</option><option value="no">画像なし</option></select><label class="inline"><input type="checkbox" id="changed">出力後に編集</label></div><div class="actions"><select id="date-field" aria-label="日付の種類"><option value="Created">作成日</option><option value="Updated">更新日</option><option value="Exported">最終出力日</option></select><label class="inline">開始<input type="date" id="from"></label><label class="inline">終了<input type="date" id="to"></label></div></details>
 <div class="table"><table><thead><tr><th><input type="checkbox" id="all" aria-label="表示中の項目を選択"></th><th><button data-sort="Title">タイトル</button></th><th><button data-sort="Group">グループ</button></th><th><button data-sort="WorkState">状態</button></th></tr></thead><tbody id="rows"></tbody></table></div>
 </section>

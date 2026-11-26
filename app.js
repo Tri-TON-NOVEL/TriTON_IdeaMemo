@@ -16,6 +16,7 @@ const fields = ['Title', 'Memo', 'Current', 'Goal', 'Acceptance'];
 const fresh = () => ({ Version: 1, Projects: [], Active: null });
 const selected = new Set();
 let db, book, sort = 'Updated', ascending = false;
+let draggedTab, deletionFolder, deleting = false;
 let historyState, undo = [], redo = [];
 let driveBase = JSON.parse(localStorage.getItem('ideamemo-drive-base') || 'null');
 let driveAuto = false, driveTimer, driveBusy = false, drivePending = false;
@@ -39,12 +40,69 @@ function openDb() {
   });
 }
 
-function readDb() {
+function readDb(key = 'data') {
   return new Promise((resolve, reject) => {
-    const request = db.transaction('workspace').objectStore('workspace').get('data');
-    request.onsuccess = () => resolve(request.result || fresh());
+    const request = db.transaction('workspace').objectStore('workspace').get(key);
+    request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error);
   });
+}
+
+async function chooseDeletionFolder() {
+  if (!window.showDirectoryPicker) throw new Error('削除バックアップ先の指定には、ChromeまたはEdgeの対応バージョンを使ってください。');
+  let folder;
+  try {
+    folder = await window.showDirectoryPicker({ id: 'idea-deletion-backups', mode: 'readwrite' });
+  } catch (error) {
+    if (error.name === 'AbortError') return;
+    throw error;
+  }
+  await new Promise((resolve, reject) => {
+    const transaction = db.transaction('workspace', 'readwrite');
+    transaction.oncomplete = resolve;
+    transaction.onabort = () => reject(transaction.error);
+    transaction.objectStore('workspace').put(folder, 'deletion-folder');
+  });
+  deletionFolder = folder;
+  notify('削除バックアップ先：' + folder.name);
+}
+
+async function backupAndDelete(project, items) {
+  if (deleting || !items.length) return;
+  deleting = true;
+  try {
+    if (!deletionFolder) {
+      await chooseDeletionFolder();
+      if (!deletionFolder) return;
+    }
+    const options = { mode: 'readwrite' };
+    if (await deletionFolder.queryPermission(options) !== 'granted' &&
+        await deletionFolder.requestPermission(options) !== 'granted') throw new Error('削除バックアップ先への書き込みが許可されていません。');
+    const data = {
+      Version: 1, Active: project.Id,
+      Projects: [{ Id: project.Id, Name: project.Name, Context: project.Context, Groups: project.Groups, Ideas: items, History: [] }]
+    };
+    const name = 'IdeaMemo-deleted-' + new Date().toISOString().replace(/[:.]/g, '-') + '-' + crypto.randomUUID() + '.json';
+    const file = await deletionFolder.getFileHandle(name, { create: true });
+    const writer = await file.createWritable();
+    try {
+      await writer.write(JSON.stringify(data));
+      await writer.close();
+    } catch (error) {
+      await writer.abort().catch(() => {});
+      throw error;
+    }
+    if (!book.Projects.includes(project) || items.some(item => !project.Ideas.includes(item))) return;
+    const ids = new Set(items.map(item => item.Id));
+    project.Ideas = project.Ideas.filter(item => !ids.has(item.Id));
+    if (ids.has(project.Focus)) project.Focus = null;
+    for (const id of ids) selected.delete(id);
+    render();
+    await save();
+    notify(items.length + ' 件をバックアップして削除しました。');
+  } finally {
+    deleting = false;
+  }
 }
 
 function save(value = book) {
@@ -144,6 +202,31 @@ function render(rebuildTabs = true) {
     }));
     tab.setAttribute('aria-current', String(p === project));
     tab.title = 'ダブルクリックでアプリ名を変更';
+    tab.draggable = true;
+    tab.ondragstart = event => {
+      draggedTab = p.Id;
+      event.dataTransfer.effectAllowed = 'move';
+      event.dataTransfer.setData('text/plain', p.Id);
+    };
+    tab.ondragover = event => {
+      if (!draggedTab || draggedTab === p.Id) return;
+      event.preventDefault();
+      event.dataTransfer.dropEffect = 'move';
+      tab.classList.add('drop-target');
+    };
+    tab.ondragleave = () => tab.classList.remove('drop-target');
+    tab.ondragend = () => { draggedTab = null; };
+    tab.ondrop = safe(async event => {
+      event.preventDefault();
+      tab.classList.remove('drop-target');
+      const source = book.Projects.findIndex(project => project.Id === draggedTab);
+      const target = book.Projects.indexOf(p);
+      draggedTab = null;
+      if (source < 0 || target < 0 || source === target) return;
+      book.Projects.splice(target, 0, book.Projects.splice(source, 1)[0]);
+      render();
+      await save();
+    });
     tab.ondblclick = () => {
       const input = Object.assign(make('input'), { value: p.Name });
       const rename = safe(async () => {
@@ -186,7 +269,7 @@ function render(rebuildTabs = true) {
 
 function visibleIdeas() {
   const terms = $('search').value.toLocaleLowerCase().trim().split(/\s+/).filter(Boolean);
-  const filter = $('filter').value;
+  const filters = new Set([...$('state-filters').querySelectorAll('input:checked')].map(input => input.value));
   const group = $('group-filter').value;
   const photo = $('image-filter').value;
   const start = $('from').value;
@@ -196,7 +279,7 @@ function visibleIdeas() {
     const stamp = i[$('date-field').value];
     const date = stamp ? dateOf(stamp) : null;
     return terms.every(term => text.includes(term)) &&
-      (!filter || (filter === '出力済' ? i.Exported > 0 : filter === '未出力' ? !i.Exported : workState(i) === filter)) &&
+      (!filters.size || filters.has(workState(i)) || filters.has(i.Exported ? '出力済' : '未出力')) &&
       (!group || (group === '@none' ? !i.Group : group === i.Group)) &&
       (!photo || (photo === 'yes') === Boolean(i.Images.length)) &&
       (!$('changed').checked || (i.Exported && i.Updated > i.Exported)) &&
@@ -579,7 +662,16 @@ async function driveDialog() {
 
 safe(async () => {
   db = await openDb();
-  book = validate(await readDb());
+  book = validate(await readDb() || fresh());
+  deletionFolder = await readDb('deletion-folder');
+  $('deletion-folder').onclick = safe(chooseDeletionFolder);
+  $('state-filters').replaceChildren(...[...states, '未出力', '出力済'].map(state => {
+    const input = Object.assign(make('input'), { type: 'checkbox', value: state, onchange: renderRows });
+    input.setAttribute('aria-label', state);
+    const label = Object.assign(make('label'), { className: 'inline' });
+    label.append(input, state);
+    return label;
+  }));
   historyState = contentState();
   refreshHistory();
   $('undo').onclick = safe(() => moveHistory(false));
@@ -648,7 +740,7 @@ safe(async () => {
     modal('グループ管理', group, button('追加', edit('add')), button('名前変更', edit('rename')), button('削除', edit('remove')));
   };
   $('all').onchange = e => { for (const i of visibleIdeas()) { if (e.target.checked) selected.add(i.Id); else selected.delete(i.Id); } renderRows(); };
-  for (const id of ['search','filter','group-filter','image-filter','changed','date-field','from','to']) $(id).oninput = renderRows;
+  for (const id of ['search','group-filter','image-filter','changed','date-field','from','to']) $(id).oninput = renderRows;
   for (const header of document.querySelectorAll('[data-sort]')) header.onclick = () => {
     ascending = sort === header.dataset.sort ? !ascending : true;
     sort = header.dataset.sort;
@@ -656,9 +748,8 @@ safe(async () => {
   };
   $('delete').onclick = safe(async () => {
     if (!selected.size || !confirm('選択した ' + selected.size + ' 件を削除しますか？ 絞り込みで非表示の項目も含みます。')) return;
-    app().Ideas = app().Ideas.filter(i => !selected.has(i.Id));
-    if (selected.has(app().Focus)) app().Focus = null;
-    selected.clear(); render(); await save();
+    const project = app();
+    await backupAndDelete(project, project.Ideas.filter(i => selected.has(i.Id)));
   });
   $('bulk').onclick = () => {
     if (!selected.size) { notify('一覧で対象項目をチェックしてください。'); return; }

@@ -16,6 +16,13 @@ const fields = ['Title', 'Memo', 'Current', 'Goal', 'Acceptance'];
 const fresh = () => ({ Version: 1, Projects: [], Active: null });
 const selected = new Set();
 let db, book, sort = 'Updated', ascending = false;
+let historyState, undo = [], redo = [];
+let driveBase = JSON.parse(localStorage.getItem('ideamemo-drive-base') || 'null');
+let driveAuto = false, driveTimer, driveBusy = false, drivePending = false;
+function rememberDrive(base) {
+  driveBase = base;
+  localStorage.setItem('ideamemo-drive-base', JSON.stringify(base && { id: base.id, version: base.version }));
+}
 let config = { driveId: '', port: 11434, model: '', ...JSON.parse(localStorage.getItem('ideamemo-settings') || '{}') };
 const app = () => book.Projects.find(p => p.Id === book.Active);
 const idea = () => app()?.Ideas.find(i => i.Id === app().Focus);
@@ -43,10 +50,47 @@ function readDb() {
 function save(value = book) {
   return new Promise((resolve, reject) => {
     const transaction = db.transaction('workspace', 'readwrite');
-    transaction.oncomplete = resolve;
+    transaction.oncomplete = () => { if (value === book) scheduleDrive(); resolve(); };
     transaction.onabort = () => reject(transaction.error || new Error('自動保存に失敗しました。'));
     transaction.objectStore('workspace').put(value, 'data');
+    if (value === book) captureHistory();
   });
+}
+
+function contentState() {
+  return JSON.stringify(book.Projects.map(({ Focus, ...project }) => project));
+}
+
+function captureHistory() {
+  const next = contentState();
+  if (next === historyState) return;
+  if (historyState !== undefined) undo.push(historyState);
+  if (undo.length > 20) undo.shift();
+  redo.length = 0;
+  historyState = next;
+  refreshHistory();
+}
+
+function refreshHistory() {
+  $('undo').disabled = !undo.length;
+  $('redo').disabled = !redo.length;
+}
+
+async function moveHistory(forward) {
+  const source = forward ? redo : undo;
+  const target = forward ? undo : redo;
+  if (!source.length) return;
+  target.push(historyState);
+  historyState = source.pop();
+  const focus = new Map(book.Projects.map(p => [p.Id, p.Focus]));
+  book.Projects = JSON.parse(historyState);
+  for (const p of book.Projects) p.Focus = focus.get(p.Id);
+  validate(book);
+  selected.clear();
+  render();
+  refreshHistory();
+  await save();
+  notify(forward ? 'やり直しました。' : '元に戻しました。');
 }
 
 function validate(value) {
@@ -69,6 +113,7 @@ async function replace(value) {
   next.Model = book.Model;
   await save(next);
   book = next;
+  captureHistory();
   selected.clear();
   render();
   return true;
@@ -363,13 +408,12 @@ function labeled(text, field) {
 }
 
 function settingsDialog() {
-  const driveId = Object.assign(make('input'), { value: config.driveId });
   const port = Object.assign(make('input'), { type: 'number', min: '1', max: '65535', value: config.port });
   const model = Object.assign(make('input'), { value: config.model });
-  modal('設定', labeled('Google OAuth WebクライアントID', driveId), labeled('Ollama 接続ポート', port),
+  modal('Ollama設定', labeled('Ollama 接続ポート', port),
     labeled('通常使うモデル名', model), button('保存', () => {
       if (!port.value || !port.checkValidity()) { port.reportValidity(); return; }
-      config = { driveId: driveId.value.trim(), port: Number(port.value), model: model.value.trim() };
+      config = { ...config, port: Number(port.value), model: model.value.trim() };
       localStorage.setItem('ideamemo-settings', JSON.stringify(config));
       $('dialog').close();
     }));
@@ -412,57 +456,143 @@ async function driveRequest(access, url, options = {}) {
   return response.json();
 }
 
-async function uploadDrive(access, upload, item, name) {
-  const url = upload + (item ? '/' + encodeURIComponent(item.id) : '') + '?uploadType=resumable';
+async function uploadDrive(access, upload, item, name, snapshot = JSON.stringify(book), folder = null) {
+  const url = upload + (item ? '/' + encodeURIComponent(item.id) : '') + '?uploadType=resumable&fields=id,version';
   const response = await fetch(url, {
     method: item ? 'PATCH' : 'POST',
     headers: { Authorization: 'Bearer ' + access, 'Content-Type': 'application/json', 'X-Upload-Content-Type': 'application/json' },
-    body: JSON.stringify(item ? {} : { name })
+    body: JSON.stringify(item ? {} : folder ? { name, parents: [folder] } : { name })
   });
   if (response.status === 401) token = null;
   const location = response.headers.get('Location');
   if (!response.ok || !location || new URL(location).origin !== 'https://www.googleapis.com')
     throw new Error('Google Driveのアップロードを開始できませんでした（HTTP ' + response.status + '）。');
-  await driveRequest(access, location, { method: 'PUT', body: JSON.stringify(book), headers: { 'Content-Type': 'application/json' } });
+  return driveRequest(access, location, { method: 'PUT', body: snapshot, headers: { 'Content-Type': 'application/json' } });
+}
+
+const driveFiles = 'https://www.googleapis.com/drive/v3/files';
+const driveUpload = 'https://www.googleapis.com/upload/drive/v3/files';
+const driveName = 'IdeaMemo.workspace.json';
+const folderType = 'application/vnd.google-apps.folder';
+
+async function findDriveFile(access, query) {
+  const params = new URLSearchParams({ q: 'trashed = false and ' + query, fields: 'files(id,version)', orderBy: 'modifiedTime desc' });
+  return (await driveRequest(access, driveFiles + '?' + params)).files[0];
+}
+
+async function createDriveFolder(access) {
+  const parent = await findDriveFile(access, "mimeType = '" + folderType + "' and name = 'プライベート' and 'root' in parents");
+  const metadata = { name: 'IdeaMemo', mimeType: folderType, appProperties: { ideamemoFolder: 'workspace' } };
+  if (parent) metadata.parents = [parent.id];
+  return driveRequest(access, driveFiles, { method: 'POST', body: JSON.stringify(metadata), headers: { 'Content-Type': 'application/json' } });
+}
+
+function scheduleDrive() {
+  if (!driveAuto || !driveBase || contentState() === driveBase.content) return;
+  drivePending = true;
+  clearTimeout(driveTimer);
+  driveTimer = setTimeout(autoDriveSave, 3000);
+}
+
+async function autoDriveSave() {
+  if (driveBusy || !drivePending || !driveAuto) return;
+  driveBusy = true;
+  drivePending = false;
+  try {
+    if (!token || Date.now() >= expires) throw new Error('設定 → Google Driveで再接続してください。');
+    const current = await driveRequest(token, driveFiles + '/' + encodeURIComponent(driveBase.id) + '?fields=id,version,trashed');
+    if (!current.version || current.trashed || current.version !== driveBase.version)
+      throw new Error('Drive側が更新されています。設定から読み込み、または保存し直してください。');
+    const snapshot = JSON.stringify(book);
+    const content = contentState();
+    if (content === driveBase.content) return;
+    const result = await uploadDrive(token, driveUpload, driveBase, driveName, snapshot);
+    if (!result.version) throw new Error('Driveの更新番号を取得できませんでした。');
+    rememberDrive({ ...result, content });
+    notify('Google Driveに自動保存しました。');
+  } catch (error) {
+    driveAuto = false;
+    notify('Drive自動保存を停止しました。 ' + error.message);
+  } finally {
+    driveBusy = false;
+    scheduleDrive();
+  }
 }
 
 async function driveDialog() {
-  if (!config.driveId) { notify('先に「設定」でGoogle OAuth WebクライアントIDを入力してください。'); settingsDialog(); return; }
+  const input = Object.assign(make('input'), { value: config.driveId });
+  const auto = Object.assign(make('input'), { type: 'checkbox', checked: driveAuto || localStorage.getItem('ideamemo-drive-auto') === '1' });
+  auto.onchange = () => {
+    localStorage.setItem('ideamemo-drive-auto', auto.checked ? '1' : '0');
+    driveAuto = auto.checked && Boolean(driveBase && token && Date.now() < expires);
+    if (driveAuto) scheduleDrive();
+    else if (auto.checked) status.textContent = '先にDriveへ保存するか、Driveから読み込んでください。';
+  };
   const status = make('p', 'Googleログインを読み込んでいます…');
-  modal('Google Drive', status);
+  modal('Google Drive設定', labeled('Google OAuth WebクライアントID', input), labeled('Google Driveに自動保存', auto), status);
   await loadGoogle();
-  const files = 'https://www.googleapis.com/drive/v3/files';
-  const upload = 'https://www.googleapis.com/upload/drive/v3/files';
-  const name = 'IdeaMemo.workspace.json';
-  let busy = false;
   async function transfer(write) {
-    if (busy) return;
-    busy = true;
+    if (driveBusy) { status.textContent = 'Google Driveに保存中です。'; return; }
+    if (!input.value.trim()) { status.textContent = 'WebクライアントIDを入力してください。'; return; }
+    if (config.driveId !== input.value.trim()) { driveAuto = false; rememberDrive(null); }
+    config.driveId = input.value.trim();
+    localStorage.setItem('ideamemo-settings', JSON.stringify(config));
+    driveBusy = true;
     try {
       const access = await authorize();
       status.textContent = 'Google Driveに接続しています…';
-      const params = new URLSearchParams({ q: "trashed = false and name = '" + name + "'", fields: 'files(id,modifiedTime)', orderBy: 'modifiedTime desc' });
-      const response = await driveRequest(access, files + '?' + params);
-      const item = response.files[0];
+      if (write === null) {
+        if (!driveBase?.id || !driveBase.version) throw new Error('先にDriveへ保存するか、Driveから読み込んでください。');
+        const file = await driveRequest(access, driveFiles + '/' + encodeURIComponent(driveBase.id) + '?fields=id,version,trashed');
+        if (file.trashed || file.version !== driveBase.version) throw new Error('Drive側が更新されています。内容を確認して読み込み、または保存し直してください。');
+        driveAuto = auto.checked;
+        status.textContent = driveAuto ? '接続しました。自動保存が有効です。' : '接続しました。';
+        return;
+      }
+      let folder = await findDriveFile(access, "mimeType = '" + folderType + "' and appProperties has { key='ideamemoFolder' and value='workspace' }");
+      let item = folder && await findDriveFile(access, "name = '" + driveName + "' and '" + folder.id + "' in parents");
+      const legacy = !write && !item;
+      if (legacy) item = await findDriveFile(access, "name = '" + driveName + "' and 'root' in parents");
       if (!write) {
         if (!item) { status.textContent = 'Google DriveにIdeaMemoのデータがありません。'; return; }
-        const incoming = await driveRequest(access, files + '/' + encodeURIComponent(item.id) + '?alt=media');
-        status.textContent = await replace(incoming) ? '読み込みました。' : '読み込みをキャンセルしました。';
+        const incoming = await driveRequest(access, driveFiles + '/' + encodeURIComponent(item.id) + '?alt=media');
+        if (!await replace(incoming)) { status.textContent = '読み込みをキャンセルしました。'; return; }
+        rememberDrive(legacy ? null : { ...item, content: contentState() });
+        status.textContent = legacy ? '旧保存先から読み込みました。「Driveに保存」でIdeaMemoフォルダーへ保存してください。' : '読み込みました。';
       } else {
         if (item && !confirm('Google DriveのIdeaMemoデータをこの端末の内容で置き換えますか？')) { status.textContent = '保存をキャンセルしました。'; return; }
-        await uploadDrive(access, upload, item, name);
+        if (!folder) folder = await createDriveFolder(access);
+        const content = contentState();
+        const result = await uploadDrive(access, driveUpload, item, driveName, JSON.stringify(book), folder.id);
+        rememberDrive({ ...result, content });
         status.textContent = '保存しました。';
       }
+      driveAuto = auto.checked && Boolean(driveBase?.id && driveBase?.version);
+      drivePending = false;
     } catch (error) { status.textContent = error.message; }
-    finally { busy = false; }
+    finally { driveBusy = false; scheduleDrive(); }
   }
   status.textContent = '保存または読み込みを選択してください。';
-  if ($('dialog').open && status.isConnected) $('dialog-body').append(button('Driveに保存', () => transfer(true)), button('Driveから読み込み', () => transfer(false)));
+  if ($('dialog').open && status.isConnected) $('dialog-body').append(button('接続・再接続', () => transfer(null)),
+    button('Driveに保存', () => transfer(true)), button('Driveから読み込み', () => transfer(false)));
 }
 
 safe(async () => {
   db = await openDb();
   book = validate(await readDb());
+  historyState = contentState();
+  refreshHistory();
+  $('undo').onclick = safe(() => moveHistory(false));
+  $('redo').onclick = safe(() => moveHistory(true));
+  document.addEventListener('keydown', safe(async event => {
+    if ($('dialog').open || !(event.ctrlKey || event.metaKey) || event.altKey ||
+        event.target.matches('input:not([type=checkbox]), textarea, [contenteditable=true]')) return;
+    const key = event.key.toLowerCase();
+    if (key === 'z' || key === 'y') {
+      event.preventDefault();
+      await moveHistory(key === 'y' || event.shiftKey);
+    }
+  }));
   $('close').onclick = () => $('dialog').close();
   $('backup').onclick = () => download('IdeaMemo.workspace.json', JSON.stringify(book));
   $('restore').onclick = () => $('import').click();

@@ -24,7 +24,7 @@ function rememberDrive(base) {
   driveBase = base;
   localStorage.setItem('ideamemo-drive-base', JSON.stringify(base && { id: base.id, version: base.version }));
 }
-let config = { driveId: '', port: 11434, model: '', ...JSON.parse(localStorage.getItem('ideamemo-settings') || '{}') };
+const config = { driveId: JSON.parse(localStorage.getItem('ideamemo-settings') || '{}').driveId || '' };
 const app = () => book.Projects.find(p => p.Id === book.Active);
 const idea = () => app()?.Ideas.find(i => i.Id === app().Focus);
 const notify = text => { $('message').textContent = text; };
@@ -392,21 +392,6 @@ function modal(title, ...content) {
   if (!$('dialog').open) $('dialog').showModal();
 }
 
-function ollamaPath(path) { return 'http://127.0.0.1:' + config.port + '/api/' + path; }
-async function ollama(path, body) {
-  const response = await fetch(ollamaPath(path), body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {});
-  if (!response.ok) throw new Error('Ollama HTTP ' + response.status);
-  return response.json();
-}
-
-async function modelList() {
-  const answer = await ollama('tags');
-  return Promise.all(answer.models.filter(m => !m.remote_host && !m.remote_model && !/[-:]cloud$/i.test(m.name)).map(async m => {
-    const detail = await ollama('show', { model: m.name }).catch(() => ({}));
-    return { name: m.name, vision: detail.capabilities?.includes('vision'), usable: !detail.capabilities || detail.capabilities.includes('completion') };
-  }));
-}
-
 function makeDraft(project, items) {
   const lines = ['# ' + project.Name + ' の改修依頼'];
   if (project.Context) lines.push('', '## 共通情報', project.Context);
@@ -427,8 +412,6 @@ function promptDialog() {
   const items = [...shown, ...project.Ideas.filter(i => !shown.includes(i))].filter(i => selected.has(i.Id));
   if (!items.length) { notify('一覧で出力する項目をチェックしてください。'); return; }
   const draft = Object.assign(make('textarea'), { rows: 12, value: makeDraft(project, items) });
-  const model = make('select');
-  model.setAttribute('aria-label', 'Ollamaモデル');
   const sequence = make('ol');
   const images = make('div');
   images.className = 'attachments';
@@ -448,29 +431,6 @@ function promptDialog() {
     images.replaceChildren(...items.flatMap(i => i.Images).map((a, index) => attachmentTile(a, null, '添付' + (index + 1) + '：' + a.Name)));
   }
   update();
-  let models = [];
-  const reload = safe(async () => {
-    models = (await modelList()).filter(m => m.usable);
-    model.replaceChildren(...models.map(m => option(m.name, m.name + (m.vision ? ' — 画像入力対応' : ''))));
-    if (models.some(m => m.name === config.model)) model.value = config.model;
-    notify(models.length ? 'モデルを取得しました。' : 'ローカルモデルがありません。');
-  });
-  const generate = button('Ollamaで生成', safe(async () => {
-    const picked = models.find(m => m.name === model.value);
-    if (!picked) throw new Error('Ollamaのモデルを取得してください。');
-    generate.disabled = true;
-    notify('生成中…');
-    try {
-      const user = { role: 'user', content: makeDraft(project, items) };
-      if (picked.vision) user.images = items.flatMap(i => i.Images.map(a => a.Data));
-      const answer = await ollama('chat', { model: picked.name, stream: false, messages: [
-        { role: 'system', content: '日本語の実装プロンプトをMarkdownで作成してください。元の仕様と添付番号を維持し、原文にない仕様を追加しないでください。' }, user
-      ] });
-      if (!answer.message?.content?.trim()) throw new Error('生成結果が空です。');
-      draft.value = answer.message.content;
-      notify('生成しました。');
-    } finally { generate.disabled = false; }
-  }));
   async function record() {
     const Time = ticks(Date.now());
     items.forEach(i => { i.Exported = Time; });
@@ -478,28 +438,15 @@ function promptDialog() {
     renderRows();
     await save();
   }
-  modal('プロンプト作成', sequence, model, button('モデル取得', reload), generate, draft,
+  modal('プロンプト作成', sequence, draft,
     button('コピーして出力済にする', safe(async () => { await navigator.clipboard.writeText(draft.value); await record(); })),
     button('Markdown保存', safe(async () => { download('prompt.md', draft.value, 'text/markdown'); await record(); })), images);
-  reload();
 }
 
 function labeled(text, field) {
   const label = make('label', text);
   label.append(field);
   return label;
-}
-
-function settingsDialog() {
-  const port = Object.assign(make('input'), { type: 'number', min: '1', max: '65535', value: config.port });
-  const model = Object.assign(make('input'), { value: config.model });
-  modal('Ollama設定', labeled('Ollama 接続ポート', port),
-    labeled('通常使うモデル名', model), button('保存', () => {
-      if (!port.value || !port.checkValidity()) { port.reportValidity(); return; }
-      config = { ...config, port: Number(port.value), model: model.value.trim() };
-      localStorage.setItem('ideamemo-settings', JSON.stringify(config));
-      $('dialog').close();
-    }));
 }
 
 let token, tokenClient, lastClientId, expires = 0;
@@ -693,7 +640,6 @@ safe(async () => {
     e.target.value = '';
     if (file && await replace(JSON.parse(await file.text()))) notify('読み込みました。');
   });
-  $('settings').onclick = settingsDialog;
   $('cloud').onclick = safe(driveDialog);
   $('app-name').onchange = safe(async e => {
     app().Name = e.target.value.trim() || app().Name;
